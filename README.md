@@ -24,7 +24,7 @@ An automated monitoring system that tracks Malaysia Stock Exchange (KLSE) price 
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/cming401/klse-target-price-telegram.git
+   git clone https://github.com/i-max-01/klse-target-price-telegram.git
    cd klse-target-price-telegram
    ```
 
