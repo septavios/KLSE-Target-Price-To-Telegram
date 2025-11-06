@@ -1,0 +1,27 @@
+# OS-specific
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+*.egg-info/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# App config and local data
+config.json
+klse_monitor.log
+data_*.json
+*.log
+
+# Build/artifacts
+dist/
+build/
+coverage/
