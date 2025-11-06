@@ -13,6 +13,7 @@ import logging
 import os
 import requests
 from typing import List, Dict, Optional
+from zoneinfo import ZoneInfo
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,6 +27,7 @@ class KLSETargetPriceMonitor:
         self.telegram_token = self.config['telegram']['bot_token']
         self.telegram_channel = self.config['telegram']['channel_id']
         self.telegram_chat_id = self.config['telegram']['chat_id']
+        self.message_cfg = self.config.get('message', {})
         
     def load_config(self, config_file: str) -> dict:
         """Load configuration from JSON file."""
@@ -287,36 +289,172 @@ class KLSETargetPriceMonitor:
         message += f"🔗 Source: https://klse.i3investor.com/web/pricetarget/latest"
         
         return message
+
+    def _parse_upside_pct(self, upside_text: str) -> Optional[float]:
+        """Extract percentage number from text like '+0.29 (20.71%)'."""
+        try:
+            if '(' in upside_text and '%' in upside_text:
+                return float(upside_text.split('(')[1].split('%')[0])
+        except Exception:
+            pass
+        return None
+
+    def format_message_html(self, data_list: List[Dict]) -> str:
+        """Format data into an HTML Telegram message with top movers and filtering."""
+        def esc(s: Optional[str]) -> str:
+            s = s or ''
+            return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+        # Time in MYT for clarity
+        now_myt = datetime.datetime.now(ZoneInfo("Asia/Kuala_Lumpur"))
+        today_str = now_myt.strftime("%Y-%m-%d %H:%M MYT")
+
+        if not data_list:
+            return f"<b>📊 KLSE Target Price Update</b>\n<i>{today_str}</i>\n\nNo new target prices available."
+
+        # Apply threshold filter
+        threshold = float(self.message_cfg.get('upside_threshold_pct', 0) or 0)
+        filtered: List[Dict] = []
+        for item in data_list:
+            pct = self._parse_upside_pct(item.get('upside_downside', ''))
+            if pct is None:
+                continue
+            if pct >= threshold:
+                filtered.append(item)
+
+        omitted_count = max(0, len(data_list) - len(filtered))
+        if not filtered:
+            # Fall back to original if filter removes everything
+            filtered = data_list
+            omitted_count = 0
+
+        # Group by stock code
+        stock_groups: Dict[str, List[Dict]] = {}
+        for it in filtered:
+            stock_groups.setdefault(it.get('stock_code', 'N/A'), []).append(it)
+
+        ranked = []
+        for code, items in stock_groups.items():
+            max_pct = 0.0
+            for it in items:
+                pct = self._parse_upside_pct(it.get('upside_downside', '')) or 0.0
+                max_pct = max(max_pct, pct)
+            ranked.append((max_pct, code, items))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+
+        # Header
+        header = f"<b>📊 KLSE Target Price Update</b>\n<i>{today_str}</i>\n\n"
+
+        # Top movers section
+        body = ""
+        if self.message_cfg.get('include_top_movers', True):
+            count = int(self.message_cfg.get('top_movers_count', 3) or 3)
+            top = ranked[:count]
+            if top:
+                body += "<b>🔥 Top Movers</b>\n<pre>"
+                for i, (pct, code, items) in enumerate(top, 1):
+                    name = esc(items[0].get('stock_name', 'N/A'))
+                    call = items[0].get('price_call', '').upper()
+                    emoji = {'BUY': '🟢', 'HOLD': '🟡', 'SELL': '🔴'}.get(call, '⚪')
+                    it = items[0]
+                    cur = it.get('current_price', 'N/A')
+                    tgt = it.get('target_price', 'N/A')
+                    up = it.get('upside_downside', '')
+                    body += f"{i}. {emoji} {code:7} {name}\n"
+                    body += f"    Cur RM{cur:>6}  Tgt RM{tgt:>6}  {up:>12}\n"
+                body += "</pre>\n\n"
+
+        # Full list
+        max_items = int(self.message_cfg.get('max_items', 50) or 50)
+        body += "<b>📋 Full List</b>\n<pre>"
+        shown = 0
+        for rank, (_, code, items) in enumerate(ranked, 1):
+            if shown >= max_items:
+                break
+            name = esc(items[0].get('stock_name', 'N/A'))
+            call = items[0].get('price_call', '').upper()
+            emoji = {'BUY': '🟢', 'HOLD': '🟡', 'SELL': '🔴'}.get(call, '⚪')
+            multi = f" ({len(items)} analysts)" if len(items) > 1 else ""
+            body += f"{rank:2}. {emoji} {code:7} {name}{multi}\n"
+            for it in items:
+                up = it.get('upside_downside', '')
+                trend = "📈" if '+' in up else ("📉" if '-' in up else "➡️")
+                cur = it.get('current_price', 'N/A')
+                tgt = it.get('target_price', 'N/A')
+                analyst = esc(it.get('analyst', 'N/A'))
+                body += f"    Cur RM{cur:>6}  Tgt RM{tgt:>6}  {trend} {up:>12}  {analyst}\n"
+            body += "\n"
+            shown += 1
+        body += "</pre>\n"
+
+        # Summary
+        buy = sum(1 for d in filtered if d.get('price_call', '').upper() == 'BUY')
+        hold = sum(1 for d in filtered if d.get('price_call', '').upper() == 'HOLD')
+        sell = sum(1 for d in filtered if d.get('price_call', '').upper() == 'SELL')
+        summary = f"<b>📊 Daily Summary</b>\n" \
+                  f"🟢 Buy: {buy}  🟡 Hold: {hold}  🔴 Sell: {sell}\n" \
+                  f"📈 Total records: {len(filtered)}\n"
+        if omitted_count:
+            summary += f"⚠️ Omitted {omitted_count} below {threshold:.0f}% upside\n"
+        summary += "\n" + \
+                   f"🔗 <a href=\"https://klse.i3investor.com/web/pricetarget/latest\">Source</a>"
+
+        message = header + body + summary
+
+        # Ensure message within Telegram limit; truncate if needed
+        max_chars = 4096
+        if len(message) > max_chars:
+            message = message[:max_chars - 50] + "\n\n… (truncated to fit Telegram limit)"
+
+        return message
     
     def send_to_telegram(self, message: str) -> bool:
         """Send message to Telegram channel."""
-        try:
-            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-            
-            data = {
-                'chat_id': self.telegram_channel,
-                'text': message,
-                'parse_mode': 'Markdown',
-                'disable_web_page_preview': True
-            }
-            
-            response = requests.post(url, data=data, timeout=10)
-            response.raise_for_status()
-            
-            result = response.json()
-            if result.get('ok'):
-                logger.info("Message sent successfully to Telegram channel")
-                return True
-            else:
-                logger.error(f"Telegram API error: {result}")
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        parse_mode = (self.message_cfg.get('parse_mode') or 'Markdown').strip()
+        reply_markup = None
+        if self.message_cfg.get('include_buttons', True):
+            reply_markup = json.dumps({
+                "inline_keyboard": [[
+                    {"text": "View Source", "url": "https://klse.i3investor.com/web/pricetarget/latest"}
+                ]]
+            })
+
+        data = {
+            'chat_id': self.telegram_channel,
+            'text': message,
+            'parse_mode': parse_mode,
+            'disable_web_page_preview': True
+        }
+        if reply_markup:
+            data['reply_markup'] = reply_markup
+
+        tries = 3
+        for attempt in range(1, tries + 1):
+            try:
+                response = requests.post(url, data=data, timeout=20)
+                response.raise_for_status()
+                result = response.json()
+                if result.get('ok'):
+                    logger.info("Message sent successfully to Telegram channel")
+                    return True
+                else:
+                    logger.error(f"Telegram API error: {result}")
+                    return False
+            except requests.RequestException as e:
+                logger.error(f"Network error sending Telegram message (attempt {attempt}/{tries}): {e}")
+                if attempt < tries:
+                    # small backoff
+                    try:
+                        import time
+                        time.sleep(1.5 * attempt)
+                    except Exception:
+                        pass
+                else:
+                    return False
+            except Exception as e:
+                logger.error(f"Failed to send Telegram message: {e}")
                 return False
-                
-        except requests.RequestException as e:
-            logger.error(f"Network error sending Telegram message: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to send Telegram message: {e}")
-            return False
     
     def is_weekday(self) -> bool:
         """Check if today is a weekday."""
@@ -343,7 +481,8 @@ class KLSETargetPriceMonitor:
             today_data = self.filter_today_data(all_data)
             
             # Format message
-            message = self.format_message(today_data)
+            use_html = (self.message_cfg.get('parse_mode', 'Markdown').upper() == 'HTML')
+            message = self.format_message_html(today_data) if use_html else self.format_message(today_data)
             
             # Send to Telegram
             success = self.send_to_telegram(message)

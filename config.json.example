@@ -12,5 +12,14 @@
     "data_source": {
         "url": "https://klse.i3investor.com/web/pricetarget/latest",
         "fallback_to_sample": true
+    },
+    "message": {
+        "parse_mode": "HTML",
+        "include_top_movers": true,
+        "top_movers_count": 3,
+        "upside_threshold_pct": 10,
+        "max_items": 50,
+        "include_buttons": true,
+        "split_long_messages": false
     }
 }

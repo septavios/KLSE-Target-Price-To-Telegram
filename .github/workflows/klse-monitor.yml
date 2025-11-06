@@ -42,6 +42,15 @@ jobs:
             "data_source": {
               "url": "https://klse.i3investor.com/web/pricetarget/latest",
               "fallback_to_sample": True
+            },
+            "message": {
+              "parse_mode": "HTML",
+              "include_top_movers": True,
+              "top_movers_count": 3,
+              "upside_threshold_pct": 10,
+              "max_items": 50,
+              "include_buttons": True,
+              "split_long_messages": False
             }
           }
           with open("config.json", "w") as f:
@@ -51,4 +60,3 @@ jobs:
 
       - name: Run monitor
         run: python klse_monitor.py
-
