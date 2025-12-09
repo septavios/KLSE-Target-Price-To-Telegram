@@ -4,6 +4,8 @@ on:
   schedule:
     # Runs at 10:00 UTC (18:00 MYT), Monday–Friday
     - cron: "0 10 * * 1-5"
+  push:
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:

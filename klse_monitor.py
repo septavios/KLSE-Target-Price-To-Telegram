@@ -11,7 +11,9 @@ import json
 import datetime
 import logging
 import os
+import re
 import requests
+from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
 from zoneinfo import ZoneInfo
 
@@ -180,17 +182,176 @@ class KLSETargetPriceMonitor:
         """Fetch KLSE target price data."""
         try:
             logger.info("Fetching KLSE target price data...")
-            
-            # TODO: Implement actual web scraping here
-            # For now, using sample data
-            logger.info("Using sample data...")
-            data_list = self.get_sample_data()
-            
-            logger.info(f"Successfully fetched {len(data_list)} target price records")
-            return data_list
-            
+
+            # Try live web scraping first
+            scraped = self.scrape_latest_targets()
+            if scraped:
+                logger.info(f"Successfully scraped {len(scraped)} target price records")
+                return scraped
+
+            # Prefer local JSON file produced by update_data.py if present
+            today = self.get_today_date()
+            local_file = f"klse_data_{today}.json"
+            if os.path.exists(local_file):
+                try:
+                    with open(local_file, 'r', encoding='utf-8') as f:
+                        payload = json.load(f)
+                        data_list = payload.get('data', [])
+                        if data_list:
+                            logger.info(f"Loaded {len(data_list)} records from local file {local_file}")
+                            return data_list
+                        else:
+                            logger.warning(f"Local file {local_file} found but contains no 'data' records; continuing")
+                except Exception as e:
+                    logger.warning(f"Failed to read local file {local_file}: {e}; continuing")
+
+            # Fallback to sample data when scraping/local file unavailable
+            use_sample = True
+            try:
+                use_sample = bool(self.config.get('data_source', {}).get('fallback_to_sample', True))
+            except Exception:
+                use_sample = True
+            if use_sample:
+                logger.info("Using sample data (fallback enabled)...")
+                data_list = self.get_sample_data()
+                logger.info(f"Successfully fetched {len(data_list)} target price records")
+                return data_list
+            else:
+                logger.warning("No data available: scraping failed, no local file, and fallback disabled")
+                return []
+
         except Exception as e:
             logger.error(f"Failed to fetch data: {e}")
+            return []
+
+    def scrape_latest_targets(self) -> List[Dict]:
+        """Scrape latest target prices from i3investor using regex on the 'dtdata' JS variable.
+
+        Returns a list of dicts matching the schema used throughout the app.
+        On any error, returns an empty list (caller will handle fallback).
+        """
+        try:
+            source_cfg = self.config.get('data_source', {})
+            url = source_cfg.get('url') or 'https://klse.i3investor.com/web/pricetarget/latest'
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+            }
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+
+            # The data is now inside a JS variable: var dtdata = [[...], ...];
+            # We used to parse <table>, now we must parse this JSON-like structure.
+            # Example snippet: var dtdata = [["2024-06-19","PBBANK","4.04","4.80","<span ...>...</span>","BUY","TA"], ...];
+            
+            match = re.search(r'var\s+dtdata\s*=\s*(\[.*?\]);', resp.text, re.DOTALL)
+            if not match:
+                logger.warning("Could not find 'var dtdata =' in source page")
+                return []
+
+            try:
+                raw_data = json.loads(match.group(1))
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse 'dtdata' JSON: {e}")
+                return []
+            
+            data_list: List[Dict] = []
+            today = self.get_today_date()
+
+            def clean_text(text: str) -> str:
+                # Some fields might contain HTML (e.g. Upside with <span>)
+                if not text:
+                    return ""
+                # Simple HTML strip if needed, or use bs4
+                if '<' in text and '>' in text:
+                    return BeautifulSoup(text, 'lxml').get_text(strip=True)
+                return text.strip()
+
+            for item in raw_data:
+                # Expected item structure based on inspection:
+                # 0: Date (YYYY-MM-DD)
+                # 1: Stock Name (e.g. "MAYBANK") - used as Name
+                # 2: Current Price (e.g. "9.95")
+                # 3: Target Price (e.g. "10.60")
+                # 4: Upside/Downside (HTML string)
+                # 5: Price Call (e.g. "BUY")
+                # 6: Firm (Analyst)
+                # Others...
+                
+                if len(item) < 7:
+                    continue
+
+                date_str = str(item[0])
+                stock_name = clean_text(str(item[1]))
+                current_price = str(item[2])
+                target_price = str(item[3])
+                upside_downside = clean_text(str(item[4]))
+                price_call = clean_text(str(item[5])).upper()
+                analyst = clean_text(str(item[6]))
+
+                # Derive stock_code from name (best-effort)
+                stock_code = (stock_name.split()[0] if stock_name else 'N/A')
+
+                # Basic validity checks
+                if not stock_name or not target_price:
+                    continue
+
+                # Normalize prices to plain strings (remove RM if present, though JSON usually clean)
+                current_price = current_price.replace('RM', '').strip()
+                target_price = target_price.replace('RM', '').strip()
+
+                # If the date_str is not today, we technically just scraped it. 
+                # The caller (fetch_target_prices) decides if we use it, 
+                # but run_monitor calls filter_today_data later. 
+                # So we just return what we found.
+                # However, for consistency, we override 'date' with 'today' 
+                # strictly if we want to treat it as "fetched today". 
+                # But better to keep original date from source if possible?
+                # The original code did: 'date': today. 
+                # Let's stick to using the scraper's valid date if valid, or today.
+                # Actually original code used `today` for all rows. 
+                # Let's assume these are "latest" so we can map them to today 
+                # OR we respect the date column. The Date column in the table is "Announcement Date" usually.
+                # Let's keep using `date_str` from table if it looks like a date,
+                # otherwise fallback or just keep it. 
+                # The original code Forced `today`. Let's stick to forcing `today` 
+                # to ensure `filter_today_data` works if it relies on exact match, 
+                # OR, better: `filter_today_data` checks if item['date'] == today.
+                # If the table has yesterday's data, we shouldn't report it as today's new target.
+                # So we should use the date from the table.
+                
+                # REVISION: Original code:
+                # item = { 'date': today, ... }
+                # Then `filter_today_data`: `if item['date'] == self.get_today_date()`
+                # This implies original scraper grabbed *everything* and labeled it TODAY.
+                # Which means `filter_today_data` was effectively a defined no-op or sanity check.
+                # BUT, if the table contains old data, labeling it "today" is wrong.
+                # The new table has a date column. We should use it.
+                
+                item_date = date_str if date_str else today
+
+                item = {
+                    'date': item_date,
+                    'stock_code': stock_code,
+                    'stock_name': stock_name,
+                    'current_price': current_price,
+                    'target_price': target_price,
+                    'upside_downside': upside_downside,
+                    'price_call': price_call,
+                    'analyst': analyst
+                }
+                data_list.append(item)
+
+            if not data_list:
+                logger.warning("Scraper parsed zero rows from dtdata")
+                return []
+
+            return data_list
+
+        except requests.RequestException as e:
+            logger.warning(f"Scraping request failed: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"Scraping parse error: {e}")
             return []
     
     def filter_today_data(self, data_list: List[Dict]) -> List[Dict]:
