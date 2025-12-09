@@ -579,7 +579,7 @@ class KLSETargetPriceMonitor:
         summary += f"📈 Total: {len(filtered)} records\n"
         
         if omitted_count > 0:
-             summary += f"⚠️ Omitted {omitted_count} calls < {threshold:.0f}% upside\n"
+             summary += f"⚠️ Omitted {omitted_count} calls &lt; {threshold:.0f}% upside\n"
              
         summary += "\n🔗 <a href=\"https://klse.i3investor.com/web/pricetarget/latest\">View on i3investor</a>"
 
