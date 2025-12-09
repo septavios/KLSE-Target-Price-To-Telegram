@@ -468,10 +468,10 @@ class KLSETargetPriceMonitor:
 
         # Time in MYT for clarity
         now_myt = datetime.datetime.now(ZoneInfo("Asia/Kuala_Lumpur"))
-        today_str = now_myt.strftime("%Y-%m-%d %H:%M MYT")
+        today_str = now_myt.strftime("%Y-%m-%d")
 
         if not data_list:
-            return f"<b>📊 KLSE Target Price Update</b>\n<i>{today_str}</i>\n\nNo new target prices available."
+            return f"📊 <b>KLSE Target Price Update</b>\n📅 <i>{today_str}</i>\n\nNo new target prices available."
 
         # Apply threshold filter
         threshold = float(self.message_cfg.get('upside_threshold_pct', 0) or 0)
@@ -494,6 +494,7 @@ class KLSETargetPriceMonitor:
         for it in filtered:
             stock_groups.setdefault(it.get('stock_code', 'N/A'), []).append(it)
 
+        # Sort groups by max upside
         ranked = []
         for code, items in stock_groups.items():
             max_pct = 0.0
@@ -504,69 +505,90 @@ class KLSETargetPriceMonitor:
         ranked.sort(key=lambda x: x[0], reverse=True)
 
         # Header
-        header = f"<b>📊 KLSE Target Price Update</b>\n<i>{today_str}</i>\n\n"
+        header = f"📊 <b>KLSE Target Price Update</b>\n📅 <i>{today_str}</i>\n\n"
 
-        # Top movers section
         body = ""
+        
+        # 1. Top Movers Section (Detailed)
+        # Show top 3 movers with bigger visual emphasis
         if self.message_cfg.get('include_top_movers', True):
             count = int(self.message_cfg.get('top_movers_count', 3) or 3)
             top = ranked[:count]
             if top:
-                body += "<b>🔥 Top Movers</b>\n<pre>"
-                for i, (pct, code, items) in enumerate(top, 1):
-                    name = esc(items[0].get('stock_name', 'N/A'))
-                    call = items[0].get('price_call', '').upper()
+                body += "<b>🔥 Top Movers</b>\n"
+                for i, (max_pct, code, items) in enumerate(top, 1):
+                    # Use the item with the highest upside for the "Top Mover" highlight
+                    best_item = max(items, key=lambda x: self._parse_upside_pct(x.get('upside_downside','')) or 0)
+                    
+                    name = esc(best_item.get('stock_name', 'N/A'))
+                    # Shorten name if too long
+                    if len(name) > 20:
+                        name = name[:20] + "..."
+                        
+                    call = best_item.get('price_call', '').upper()
                     emoji = {'BUY': '🟢', 'HOLD': '🟡', 'SELL': '🔴'}.get(call, '⚪')
-                    it = items[0]
-                    cur = it.get('current_price', 'N/A')
-                    tgt = it.get('target_price', 'N/A')
-                    up = it.get('upside_downside', '')
-                    body += f"{i}. {emoji} {code:7} {name}\n"
-                    body += f"    Cur RM{cur:>6}  Tgt RM{tgt:>6}  {up:>12}\n"
-                body += "</pre>\n\n"
+                    cur = best_item.get('current_price', '?')
+                    tgt = best_item.get('target_price', '?')
+                    analyst = esc(best_item.get('analyst', 'N/A'))
+                    
+                    # specific format: 1. CODE (Pct%) Emoji CALL
+                    body += f"{i}. <b>{code}</b> ({max_pct:.0f}%) {emoji} {call}\n"
+                    body += f"   RM {cur} ➔ <b>RM {tgt}</b>\n"
+                    body += f"   <i>{analyst}</i>\n\n"
 
-        # Full list
+        # 2. Daily Calls List (Compact but clear)
+        # We list ALL filtered stocks (including top movers, repeated for completeness or skipped? 
+        # Typically lists include everything. Let's include everything but grouped nicely.)
+        
+        body += "<b>📋 Latest Calls</b>\n"
         max_items = int(self.message_cfg.get('max_items', 50) or 50)
-        body += "<b>📋 Full List</b>\n<pre>"
-        shown = 0
-        for rank, (_, code, items) in enumerate(ranked, 1):
-            if shown >= max_items:
+        shown_count = 0
+        
+        for max_pct, code, items in ranked:
+            if shown_count >= max_items:
                 break
-            name = esc(items[0].get('stock_name', 'N/A'))
-            call = items[0].get('price_call', '').upper()
-            emoji = {'BUY': '🟢', 'HOLD': '🟡', 'SELL': '🔴'}.get(call, '⚪')
-            multi = f" ({len(items)} analysts)" if len(items) > 1 else ""
-            body += f"{rank:2}. {emoji} {code:7} {name}{multi}\n"
+                
+            # Header for Stock
+            # AXIATA (6888)
+            code_esc = esc(code)
+            body += f"<b>{code_esc}</b>\n"
+            
             for it in items:
-                up = it.get('upside_downside', '')
-                trend = "📈" if '+' in up else ("📉" if '-' in up else "➡️")
-                cur = it.get('current_price', 'N/A')
-                tgt = it.get('target_price', 'N/A')
-                analyst = esc(it.get('analyst', 'N/A'))
-                body += f"    Cur RM{cur:>6}  Tgt RM{tgt:>6}  {trend} {up:>12}  {analyst}\n"
+                call = it.get('price_call', '').upper()
+                emoji = {'BUY': '🟢', 'HOLD': '🟡', 'SELL': '🔴'}.get(call, '⚪')
+                cur = it.get('current_price', '?')
+                tgt = it.get('target_price', '?')
+                up_str = it.get('upside_downside', '')
+                pct_val = self._parse_upside_pct(up_str)
+                pct_str = f"{pct_val:.0f}%" if pct_val is not None else "?"
+                analyst = esc(it.get('analyst', ''))
+                
+                # • 🟢 BUY | 2.57 ➔ 2.95 (+15%) | RHB-OSK
+                body += f"• {emoji} {call} | {cur} ➔ {tgt} ({pct_str}) | <i>{analyst}</i>\n"
+            
             body += "\n"
-            shown += 1
-        body += "</pre>\n"
+            shown_count += 1
 
-        # Summary
-        buy = sum(1 for d in filtered if d.get('price_call', '').upper() == 'BUY')
-        hold = sum(1 for d in filtered if d.get('price_call', '').upper() == 'HOLD')
-        sell = sum(1 for d in filtered if d.get('price_call', '').upper() == 'SELL')
-        summary = f"<b>📊 Daily Summary</b>\n" \
-                  f"🟢 Buy: {buy}  🟡 Hold: {hold}  🔴 Sell: {sell}\n" \
-                  f"📈 Total records: {len(filtered)}\n"
-        if omitted_count:
-            summary += f"⚠️ Omitted {omitted_count} below {threshold:.0f}% upside\n"
-        summary += "\n" + \
-                   f"🔗 <a href=\"https://klse.i3investor.com/web/pricetarget/latest\">Source</a>"
+        # Summary Statistics
+        buy_count = sum(1 for d in filtered if d.get('price_call', '').upper() == 'BUY')
+        hold_count = sum(1 for d in filtered if d.get('price_call', '').upper() == 'HOLD')
+        sell_count = sum(1 for d in filtered if d.get('price_call', '').upper() == 'SELL')
+        
+        summary = "<b>📊 Summary</b>\n"
+        summary += f"🟢 Buy: {buy_count}  🟡 Hold: {hold_count}  🔴 Sell: {sell_count}\n"
+        summary += f"📈 Total: {len(filtered)} records\n"
+        
+        if omitted_count > 0:
+             summary += f"⚠️ Omitted {omitted_count} calls < {threshold:.0f}% upside\n"
+             
+        summary += "\n🔗 <a href=\"https://klse.i3investor.com/web/pricetarget/latest\">View on i3investor</a>"
 
         message = header + body + summary
 
-        # Ensure message within Telegram limit; truncate if needed
-        max_chars = 4096
-        if len(message) > max_chars:
-            message = message[:max_chars - 50] + "\n\n… (truncated to fit Telegram limit)"
-
+        # Truncate if too long (Telegram limit 4096)
+        if len(message) > 4096:
+            message = message[:4000] + "\n\n… (truncated)"
+            
         return message
     
     def send_to_telegram(self, message: str) -> bool:
